@@ -2,8 +2,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import math
-
-
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 # ==============================
 # 1. 全连接 PINN 网络
 # ==============================
@@ -68,10 +69,23 @@ class SlopeGeom:
         self.rh = self.r(self.thetah)
 
     def r(self, theta):
-        return self.r0 * torch.exp((theta - self.theta0) * math.tan(self.phi))
+        # 如果 theta 是 float，先转换成 Tensor
+        if not torch.is_tensor(theta):
+            theta = torch.tensor(theta, dtype=torch.float32)
+
+        tan_phi = torch.tensor(math.tan(self.phi), dtype=theta.dtype, device=theta.device)
+        theta0 = torch.tensor(self.theta0, dtype=theta.dtype, device=theta.device)
+
+        return self.r0 * torch.exp((theta - theta0) * tan_phi)
 
     def rp(self, theta):
-        return self.r0p * torch.exp(-(theta - self.theta0) * math.tan(self.phi))
+        if not torch.is_tensor(theta):
+            theta = torch.tensor(theta, dtype=torch.float32)
+
+        tan_phi = torch.tensor(math.tan(self.phi), dtype=theta.dtype, device=theta.device)
+        theta0 = torch.tensor(self.theta0, dtype=theta.dtype, device=theta.device)
+
+        return self.r0p * torch.exp(-(theta - theta0) * tan_phi)
 
     def midpoint_xyz(self, theta, r, rp):
         """
@@ -215,12 +229,30 @@ def pinn_rc_loss(geom: SlopeGeom, net: FCNet,
                   'loss_bo': loss_bo.detach().item()}
 
 
+
+def export_failure_surface_points(net, geom, n_alpha=200, n_theta=200, device="cpu"):
+    net.eval()
+    alpha_vals = torch.linspace(0, 2*math.pi, n_alpha, device=device)
+    theta_vals = torch.linspace(geom.theta0, geom.thetah, n_theta, device=device)
+
+    alpha_grid, theta_grid = torch.meshgrid(alpha_vals, theta_vals, indexing='ij')
+    alpha_flat = alpha_grid.reshape(-1, 1)
+    theta_flat = theta_grid.reshape(-1, 1)
+
+    with torch.no_grad():
+        rc, x, y, z, r, rp = compute_xyz_rc(geom, net, alpha_flat, theta_flat)
+
+    pts = torch.cat([x, y, z], dim=-1).cpu().numpy()  # [N, 3]
+    return pts
+
+
+
 # ==============================
 # 5. 训练循环
 # ==============================
 def train_pinn_rc(
         device="cuda" if torch.cuda.is_available() else "cpu",
-        num_epochs=20000,
+        num_epochs=10000,
         batch_size=2048,
         lr=1e-3):
 
@@ -261,4 +293,25 @@ def train_pinn_rc(
 
 if __name__ == "__main__":
     net, geom = train_pinn_rc()
-    # 训练完之后，你可以在 (alpha, theta) 网格上采样，导出 (x,y,z) 点云可视化滑动面。
+
+    # 生成滑动面点云
+    pts = export_failure_surface_points(net, geom, n_alpha=200, n_theta=200, device=net.net[0].weight.device)
+
+    # 保存到TXT文件
+
+    np.savetxt("failure_surface_points.txt", pts)
+
+    print("点云保存到 failure_surface_points.txt，点数：", pts.shape[0])
+
+
+
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
+    ax.scatter(pts[:,0], pts[:,1], pts[:,2], s=1)
+
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    plt.title("Predicted 3D Failure Surface by PINN")
+
+    plt.show()
