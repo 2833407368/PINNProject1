@@ -1,205 +1,264 @@
-import math
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-DTYPE = torch.float32
+import math
 
 
-# =========================
-# 1. r_c(α, θ) 神经网络
-# =========================
-class RCNet(nn.Module):
-    def __init__(self, in_dim=2, hidden=64, n_layers=3, min_r=0.1):
+# ==============================
+# 1. 全连接 PINN 网络
+# ==============================
+class FCNet(nn.Module):
+    """
+    输入: (alpha, theta) 二维
+    输出: rc  (标量)
+    激活: tanh （论文也是用 tanh）
+    """
+    def __init__(self, in_dim=2, out_dim=1, hidden_dim=64, num_hidden=6):
         super().__init__()
-        self.min_r = min_r
-        layers = [nn.Linear(in_dim, hidden), nn.Tanh()]
-        for _ in range(n_layers - 1):
-            layers += [nn.Linear(hidden, hidden), nn.Tanh()]
-        layers.append(nn.Linear(hidden, 1))
-        self.model = nn.Sequential(*layers)
+        layers = []
+        last_dim = in_dim
+        for _ in range(num_hidden):
+            layers.append(nn.Linear(last_dim, hidden_dim))
+            layers.append(nn.Tanh())
+            last_dim = hidden_dim
+        layers.append(nn.Linear(last_dim, out_dim))
+        self.net = nn.Sequential(*layers)
 
-        # Xavier 初始化
-        for m in self.model:
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                nn.init.zeros_(m.bias)
-
-    def forward(self, pts):
-        raw = self.model(pts)
-        # softplus + min_r 确保 r_c > 0，防止塌到 0 变成断面
-        return self.min_r + torch.nn.functional.softplus(raw)
+    def forward(self, alpha, theta):
+        # alpha, theta: [N, 1]
+        x = torch.cat([alpha, theta], dim=-1)  # [N, 2]
+        rc = self.net(x)                       # [N, 1]
+        return rc
 
 
-# =========================
-# 2. 附录公式：坐标 + 偏导（有梯度）
-# =========================
-def compute_xyz_and_partials(rc_net, alpha, theta, params):
-    alpha = alpha.to(DEVICE, dtype=DTYPE)
-    theta = theta.to(DEVICE, dtype=DTYPE)
-    pts = torch.cat([alpha, theta], dim=1)
-    pts.requires_grad_(True)
+# ==============================
+# 2. 边坡几何 + 3D 旋转机制参数
+# ==============================
+class SlopeGeom:
+    """
+    这里先实现均质土坡 + 旋转机制参数给定的情况。
+    如果要完全复现论文，需要外层再套 PSO 来同时优化 (theta0, thetah, r0p_r0)。
+    """
 
-    rc = rc_net(pts)
+    def __init__(self,
+                 H=5.0,         # 坡高
+                 B_over_H=2.0,  # 宽高比 B/H
+                 beta_deg=75.0, # 坡面倾角
+                 phi_deg=15.0,  # 内摩擦角 φ
+                 theta0_deg=20.0,
+                 thetah_deg=100.0,
+                 r0=1.0,
+                 r0p_r0=0.2):
+        self.H = H
+        self.B_over_H = B_over_H
+        self.beta = math.radians(beta_deg)
+        self.phi = math.radians(phi_deg)
 
-    # Eq.(7)(8) 中的 r 和 r'
-    r0 = params['r0']
-    r0p = params['r0p']
-    theta0 = params['theta0']
-    tanphi = params['tanphi']
-    rh = params['rh']
-    theta_h = params['theta_h']
+        self.theta0 = math.radians(theta0_deg)
+        self.thetah = math.radians(thetah_deg)
 
-    theta_flat = pts[:, 1:2]
+        self.r0 = r0
+        self.r0p = r0p_r0 * r0
 
-    r = r0 * torch.exp((theta_flat - theta0) * tanphi)
-    rp = r0p * torch.exp(-(theta_flat - theta0) * tanphi)
+        # 按式 (7)、(8) 可以求任意 theta 下的 r, r'
+        # r(θ) = r0 * exp((θ-θ0)*tanφ)
+        # r'(θ) = r0' * exp(-(θ-θ0)*tanφ)
 
-    dr_dtheta = r * tanphi
-    drp_dtheta = -rp * tanphi
+        # 方便后面用：rh = r(θh)
+        self.rh = self.r(self.thetah)
 
-    rsum = r + rp
-    drsum_dtheta = dr_dtheta + drp_dtheta
+    def r(self, theta):
+        return self.r0 * torch.exp((theta - self.theta0) * math.tan(self.phi))
 
-    cos_t = torch.cos(theta_flat)
-    sin_t = torch.sin(theta_flat)
+    def rp(self, theta):
+        return self.r0p * torch.exp(-(theta - self.theta0) * math.tan(self.phi))
 
-    # 中点 (xm, ym, zm)，按附录表达式
-    xm = torch.zeros_like(rc)
-    ym = 0.5 * rsum * cos_t - rh * math.cos(theta_h)
-    zm = rh * math.sin(theta_h) - 0.5 * rsum * sin_t
+    def midpoint_xyz(self, theta, r, rp):
+        """
+        对应附录公式 (A1)：
+        xm = 0
+        ym = 0.5(r+r')cosθ - rh cosθh
+        zm = rh sinθh - 0.5(r+r')sinθ
+        这里用 torch 写成向量形式。
+        """
+        xm = torch.zeros_like(theta)
 
-    # Eq.(9) 中的极坐标到 (x,y,z)
-    sin_a = torch.sin(alpha)
-    cos_a = torch.cos(alpha)
+        ym = 0.5 * (r + rp) * torch.cos(theta) - self.rh * math.cos(self.thetah)
+        zm = self.rh * math.sin(self.thetah) - 0.5 * (r + rp) * torch.sin(theta)
+        return xm, ym, zm
 
-    x = xm + rc * sin_a
-    y = ym + rc * cos_a * cos_t
-    z = zm - rc * cos_a * sin_t
-
-    # 自动微分求 rc 对 α、θ 的偏导
-    grads = torch.autograd.grad(rc.sum(), pts, create_graph=True)[0]
-    drc_dalpha = grads[:, 0:1]
-    drc_dtheta = grads[:, 1:2]
-
-    # 链式求导求 ∂x/∂α, ∂x/∂θ 等（附录里的推导）
-    dx_dalpha = drc_dalpha * sin_a + rc * cos_a
-    dx_dtheta = drc_dtheta * sin_a
-
-    dym_dtheta = 0.5 * drsum_dtheta * cos_t - 0.5 * rsum * sin_t
-    dy_dalpha = drc_dalpha * cos_a * cos_t - rc * sin_a * cos_t
-    dy_dtheta = dym_dtheta + drc_dtheta * cos_a * cos_t - rc * cos_a * sin_t
-
-    dzm_dtheta = -0.5 * drsum_dtheta * sin_t - 0.5 * rsum * cos_t
-    dz_dalpha = -drc_dalpha * cos_a * sin_t + rc * sin_a * sin_t
-    dz_dtheta = dzm_dtheta - drc_dtheta * cos_a * sin_t - rc * cos_a * cos_t
-
-    return {
-        'pts': pts,
-        'rc': rc,
-        'x': x, 'y': y, 'z': z,
-        'dx_dalpha': dx_dalpha, 'dx_dtheta': dx_dtheta,
-        'dy_dalpha': dy_dalpha, 'dy_dtheta': dy_dtheta,
-        'dz_dalpha': dz_dalpha, 'dz_dtheta': dz_dtheta
-    }
+    def slope_surface_z(self, y):
+        """
+        简单实现一个平面坡面 z(y) 供筛选/约束用。
+        假设坡脚在原点 (0,0,0)，坡面抬升 H，倾角 beta。
+        y 轴沿着坡面水平方向。
+        z = y * tan(beta)   (0 <= y <= H/tan(beta))
+        实际论文几何可以根据你真实算例再细化。
+        """
+        return y * math.tan(self.beta)
 
 
-# =========================
-# 3. Loss_go：流动法则几何约束
-# =========================
-def loss_go(parts, phi):
-    ux = parts['dx_dtheta']
-    uy = parts['dy_dtheta']
-    uz = parts['dz_dtheta']
-    vx = parts['dx_dalpha']
-    vy = parts['dy_dalpha']
-    vz = parts['dz_dalpha']
+# ==============================
+# 3. 3D 坐标 & 法向量计算
+# ==============================
+def compute_xyz_rc(geom: SlopeGeom, net: FCNet, alpha, theta):
+    """
+    给定 alpha, theta，网络输出 rc，并根据式 (9) 计算 (x, y, z)。
+    返回:
+        rc: [N, 1]
+        x, y, z: [N, 1]
+    """
+    rc = net(alpha, theta)  # [N, 1]
+    r = geom.r(theta)       # [N, 1]
+    rp = geom.rp(theta)     # [N, 1]
 
-    # n = ∂Γ/∂θ × ∂Γ/∂α
-    nx = uy * vz - uz * vy
-    ny = uz * vx - ux * vz
-    nz = ux * vy - uy * vx
-    n_norm = torch.sqrt(nx ** 2 + ny ** 2 + nz ** 2 + 1e-9)
+    xm, ym, zm = geom.midpoint_xyz(theta, r, rp)  # [N, 1] each
 
-    theta = parts['pts'][:, 1:2]
-    v_hat = torch.cat([
-        torch.zeros_like(theta),
-        -torch.cos(theta),
-        -torch.sin(theta)
-    ], dim=1)
+    # 式 (9)
+    x = xm + rc * torch.sin(alpha)
+    y = ym + rc * torch.cos(alpha) * torch.cos(theta)
+    z = zm - rc * torch.cos(alpha) * torch.sin(theta)
 
-    dot = (nx * v_hat[:, 0] + ny * v_hat[:, 1] + nz * v_hat[:, 2]) / n_norm[:, 0]
-
-    return torch.mean((dot + math.sin(phi)) ** 2)
+    return rc, x, y, z, r, rp
 
 
-# =========================
-# 4. Loss_bo：上/下界约束（Fig.5 里的平滑边界）
-# =========================
-def loss_bo(rc_up, rc_low, alpha, params, k=80.0):
-    rd = params['rd']
-    alpha_u = params['alpha_u']
-    alpha_l = params['alpha_l']
+def compute_normals_and_residual(geom: SlopeGeom, net: FCNet, alpha, theta):
+    """
+    用自动求导计算 dΓ/dα, dΓ/dθ，得到法向量 n，并算 PDE 残差:
+        n̂ · v̂ + sinφ
+    """
+    alpha.requires_grad_(True)
+    theta.requires_grad_(True)
 
-    s_u = torch.tanh(k * (alpha - alpha_u))
-    s_l = torch.tanh(k * (alpha - alpha_l))
+    rc, x, y, z, r, rp = compute_xyz_rc(geom, net, alpha, theta)
 
-    return torch.mean(((rc_up - rd) * (1 - s_u)) ** 2 +
-                      ((rc_low - rd) * (1 + s_l)) ** 2)
+    # 计算 dΓ/dθ
+    grads_x_theta = torch.autograd.grad(x, theta, grad_outputs=torch.ones_like(x),
+                                        retain_graph=True, create_graph=True)[0]
+    grads_y_theta = torch.autograd.grad(y, theta, grad_outputs=torch.ones_like(y),
+                                        retain_graph=True, create_graph=True)[0]
+    grads_z_theta = torch.autograd.grad(z, theta, grad_outputs=torch.ones_like(z),
+                                        retain_graph=True, create_graph=True)[0]
+
+    # 计算 dΓ/dα
+    grads_x_alpha = torch.autograd.grad(x, alpha, grad_outputs=torch.ones_like(x),
+                                        retain_graph=True, create_graph=True)[0]
+    grads_y_alpha = torch.autograd.grad(y, alpha, grad_outputs=torch.ones_like(y),
+                                        retain_graph=True, create_graph=True)[0]
+    grads_z_alpha = torch.autograd.grad(z, alpha, grad_outputs=torch.ones_like(z),
+                                        retain_graph=True, create_graph=True)[0]
+
+    # 拼成向量 [N, 3]
+    dG_dtheta = torch.stack([grads_x_theta, grads_y_theta, grads_z_theta], dim=-1)
+    dG_dalpha = torch.stack([grads_x_alpha, grads_y_alpha, grads_z_alpha], dim=-1)
+
+    # n = dG/dθ × dG/dα
+    n = torch.cross(dG_dtheta, dG_dalpha, dim=-1)  # [N, 3]
+    n_norm = torch.norm(n, dim=-1, keepdim=True) + 1e-12
+    n_hat = n / n_norm
+
+    # v̂ = (0, -cosθ, -sinθ)
+    v_hat = torch.stack([
+        torch.zeros_like(theta.squeeze(-1)),
+        -torch.cos(theta.squeeze(-1)),
+        -torch.sin(theta.squeeze(-1))
+    ], dim=-1)  # [N, 3]
+
+    # n̂ · v̂
+    dot_nv = (n_hat * v_hat).sum(dim=-1, keepdim=True)  # [N, 1]
+
+    # 残差: n̂·v̂ + sinφ = 0
+    residual = dot_nv + math.sin(geom.phi)  # [N, 1]
+    return residual, rc, x, y, z, r, rp
 
 
-# =========================
-# 5. 训练（纯图 5 几何 PINN）
-# =========================
-def train_fig5(num_iters=4000, colloc=4000):
-    params = {
-        'r0': 1.0,
-        'r0p': 0.8,
-        'theta0': 0.0,
-        'tanphi': math.tan(math.radians(25.0)),
-        'rh': 0.5,
-        'theta_h': 1.2,
-        'alpha_u': 0.0,
-        'alpha_l': math.pi,
-        'rd': 0.2,
-        'phi': math.radians(25.0)
-    }
+# ==============================
+# 4. Physics loss (PDE + 边界)
+# ==============================
+def pinn_rc_loss(geom: SlopeGeom, net: FCNet,
+                 alpha, theta,
+                 alpha_u=0.2*math.pi, alpha_l=1.8*math.pi):
+    """
+    alpha, theta: [N, 1]
+    """
+    residual, rc, x, y, z, r, rp = compute_normals_and_residual(geom, net, alpha, theta)
 
-    net_up = RCNet().to(DEVICE)
-    net_low = RCNet().to(DEVICE)
+    # ---- (1) Governing Equation Loss (式 20) ----
+    loss_go = (residual ** 2).mean()
 
-    optimizer = optim.Adam(
-        list(net_up.parameters()) + list(net_low.parameters()),
-        lr=1e-3
+    # ---- (2) Boundary Loss (简化版的式 21) ----
+    # rd = (r - r') / 2
+    rd = 0.5 * (r - rp)
+
+    # 上边界: alpha < alpha_u 的点，让 rc → rd
+    mask_up = (alpha < alpha_u).float()
+    # 下边界: alpha > alpha_l 的点，让 rc → rd
+    mask_low = (alpha > alpha_l).float()
+
+    # 为了数值稳定，取平均时加一个 eps，避免分母为 0
+    eps = 1e-8
+    if mask_up.sum() > 0:
+        loss_bo_up = (((rc - rd) * mask_up) ** 2).sum() / (mask_up.sum() + eps)
+    else:
+        loss_bo_up = torch.tensor(0.0, device=alpha.device)
+
+    if mask_low.sum() > 0:
+        loss_bo_low = (((rc - rd) * mask_low) ** 2).sum() / (mask_low.sum() + eps)
+    else:
+        loss_bo_low = torch.tensor(0.0, device=alpha.device)
+
+    loss_bo = loss_bo_up + loss_bo_low
+
+    loss = loss_go + loss_bo
+
+    return loss, {'loss_go': loss_go.detach().item(),
+                  'loss_bo': loss_bo.detach().item()}
+
+
+# ==============================
+# 5. 训练循环
+# ==============================
+def train_pinn_rc(
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        num_epochs=20000,
+        batch_size=2048,
+        lr=1e-3):
+
+    geom = SlopeGeom(
+        H=5.0,
+        B_over_H=2.0,
+        beta_deg=75.0,
+        phi_deg=15.0,
+        theta0_deg=23.9,   # 你可以用论文 case 13 的最优值
+        thetah_deg=76.7,
+        r0=1.0,
+        r0p_r0=0.131
     )
 
-    for it in range(1, num_iters + 1):
-        # 随机采样 α–θ collocation 点
-        alpha = torch.rand(colloc, 1, device=DEVICE) * 2 * math.pi
-        theta = torch.rand(colloc, 1, device=DEVICE) * 1.2
+    net = FCNet(in_dim=2, out_dim=1, hidden_dim=64, num_hidden=6).to(device)
+    optimizer = optim.Adam(net.parameters(), lr=lr)
 
-        parts_up = compute_xyz_and_partials(net_up, alpha, theta, params)
-        parts_low = compute_xyz_and_partials(net_low, alpha, theta, params)
+    for epoch in range(1, num_epochs + 1):
+        # 采样 alpha, theta
+        # alpha ∈ [0, 2π], theta ∈ [theta0, thetah]
+        alpha = (2 * math.pi) * torch.rand(batch_size, 1, device=device)
+        theta = geom.theta0 + (geom.thetah - geom.theta0) * torch.rand(batch_size, 1, device=device)
 
-        Lgo_up = loss_go(parts_up, params['phi'])
-        Lgo_low = loss_go(parts_low, params['phi'])
-        Lgo = 0.5 * (Lgo_up + Lgo_low)
-
-        Lbo = loss_bo(parts_up['rc'], parts_low['rc'], alpha, params)
-
-        loss = Lgo + 0.2 * Lbo
+        loss, loss_items = pinn_rc_loss(geom, net, alpha, theta)
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        if it == 1 or it % 200 == 0:
-            print(f"Iter {it}/{num_iters}  Lgo={Lgo.item():.3e}  Lbo={Lbo.item():.3e}")
+        if epoch % 500 == 0:
+            print(f"Epoch {epoch:6d} | "
+                  f"Loss = {loss.item():.4e} | "
+                  f"Loss_go = {loss_items['loss_go']:.4e} | "
+                  f"Loss_bo = {loss_items['loss_bo']:.4e}")
 
-    return net_up, net_low, params
+    return net, geom
 
 
 if __name__ == "__main__":
-    net_u, net_l, params = train_fig5()
+    net, geom = train_pinn_rc()
+    # 训练完之后，你可以在 (alpha, theta) 网格上采样，导出 (x,y,z) 点云可视化滑动面。
